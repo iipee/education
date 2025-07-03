@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "vuetify-nuxt-module": "^0.18.7"
+  }
+}
