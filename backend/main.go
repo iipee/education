@@ -16,10 +16,11 @@ import (
 type User struct {
 	ID          int      `json:"id" gorm:"primaryKey"`
 	Username    string   `json:"username" gorm:"unique"`
+	Email       string   `json:"email" gorm:"unique"`
 	Password    string   `json:"password"`
 	Role        string   `json:"role"`
 	Description string   `json:"description"`
-	Services    []string `json:"services" gorm:"type:text[]"`
+	Services    []string `json:"services" gorm:"type:jsonb"`
 }
 
 type Course struct {
