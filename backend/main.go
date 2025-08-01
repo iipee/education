@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -114,6 +115,14 @@ type Review struct {
 	CreatedAt      time.Time `json:"created_at" gorm:"autoCreateTime"`
 }
 
+type Dialog struct {
+	UserID      int    `json:"user_id"`
+	FullName    string `json:"full_name"`
+	AvatarURL   string `json:"avatar_url"`
+	LastMessage string `json:"last_message"`
+	UnreadCount int    `json:"unread_count"`
+}
+
 func main() {
 	if os.Getenv("JWT_SECRET") == "" {
 		panic("JWT_SECRET not set")
@@ -142,16 +151,20 @@ func main() {
 		c.Next()
 	})
 
+	r.GET("/api", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "API is running"})
+	})
+
 	r.POST("/api/register", registerUser)
 	r.POST("/api/login", loginUser)
 	r.GET("/api/profile", authMiddleware(), getOwnProfile)
-	r.GET("/api/profile/:id", authMiddleware(), getOtherProfile)
+	r.GET("/api/profile/:id", getOtherProfile)
 	r.PUT("/api/profile", authMiddleware(), updateProfile)
 	r.GET("/api/search", searchCourses)
 	r.GET("/api/courses", authMiddleware(), getCourses)
 	r.POST("/api/courses", authMiddleware("nutri"), createCourse)
 	r.PUT("/api/courses/:id", authMiddleware("nutri"), updateCourse)
-	r.GET("/api/courses/:id", authMiddleware(), getCourseById)
+	r.GET("/api/courses/:id", getCourseById)
 	r.DELETE("/api/courses/:id", authMiddleware("nutri"), deleteCourse)
 	r.POST("/api/payments/simulate", authMiddleware("client"), simulatePayment)
 	r.GET("/api/payments", authMiddleware(), getPayments)
@@ -162,10 +175,12 @@ func main() {
 	r.GET("/api/notifications", authMiddleware(), getNotifications)
 	r.PUT("/api/notifications/:id/read", authMiddleware(), markNotificationRead)
 	r.POST("/api/reviews", authMiddleware("client"), createReview)
-	r.GET("/api/reviews/user/:user_id", authMiddleware(), getReviewsByUser)
-	r.GET("/api/reviews/course/:course_id", authMiddleware(), getReviewsByCourse)
+	r.GET("/api/reviews/user/:user_id", getReviewsByUser)
+	r.GET("/api/reviews/course/:course_id", getReviewsByCourse)
 	r.GET("/api/nutris", getNutris)
 	r.GET("/api/reviews/random", getRandomReviews)
+	r.POST("/api/start-chat", startChat)
+	r.GET("/api/chats", getChats)
 	r.GET("/ws", handleWebSocket)
 
 	r.Run(":8080")
@@ -306,7 +321,6 @@ func updateProfile(c *gin.Context) {
 	if err := db.Model(&User{}).Where("id = ?", userID).Updates(map[string]interface{}{
 		"full_name":   input.FullName,
 		"description": input.Description,
-		"services":    input.Services,
 	}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Не удалось обновить профиль"})
 		return
@@ -498,6 +512,11 @@ func sendMessage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	var receiver User
+	if err := db.First(&receiver, msg.ReceiverID).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Получатель не существует"})
+		return
+	}
 	msg.SenderID = c.GetInt("user_id")
 	msg.Read = false
 	msg.CreatedAt = time.Now()
@@ -614,8 +633,26 @@ func getReviewsByCourse(c *gin.Context) {
 }
 
 func getNutris(c *gin.Context) {
+	limitStr := c.Query("limit")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 4 // Default limit as per your request
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	random := c.Query("random") == "true"
+	q := db.Where("role = 'nutri'")
+	if random {
+		q = q.Order("RANDOM()")
+	}
 	var users []User
-	db.Where("role = 'nutri'").Limit(3).Find(&users)
+	if err := q.Limit(limit).Find(&users).Error; err != nil {
+		log.Println("getNutris error:", err)
+		c.JSON(http.StatusOK, []User{})
+		return
+	}
+	log.Printf("getNutris found %d nutris", len(users))
 	for i := range users {
 		users[i].Password = ""
 	}
@@ -626,6 +663,37 @@ func getRandomReviews(c *gin.Context) {
 	var reviews []Review
 	db.Order("RANDOM()").Limit(3).Find(&reviews)
 	c.JSON(http.StatusOK, reviews)
+}
+
+func startChat(c *gin.Context) {
+	var input struct {
+		ReceiverID int `json:"receiver_id"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var receiver User
+	if err := db.First(&receiver, input.ReceiverID).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Пользователь не найден"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"receiver_id": input.ReceiverID})
+}
+
+func getChats(c *gin.Context) {
+	userID := c.GetInt("user_id")
+	var dialogs []Dialog
+	db.Raw(`
+		SELECT DISTINCT ON (u.id) u.id as user_id, u.full_name, '' as avatar_url, m.content as last_message, 
+		COUNT(CASE WHEN m.read = false AND m.sender_id = u.id THEN 1 END) as unread_count
+		FROM users u
+		JOIN messages m ON (m.sender_id = u.id AND m.receiver_id = ?) OR (m.receiver_id = u.id AND m.sender_id = ?)
+		WHERE u.id != ?
+		GROUP BY u.id, m.content
+		ORDER BY u.id, m.created_at DESC
+	`, userID, userID, userID).Scan(&dialogs)
+	c.JSON(http.StatusOK, dialogs)
 }
 
 func handleWebSocket(c *gin.Context) {
