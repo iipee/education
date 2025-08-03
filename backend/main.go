@@ -21,30 +21,30 @@ import (
 	"gorm.io/gorm"
 )
 
-// StringArray - пользовательский тип для обработки jsonb как []string
 type StringArray []string
 
-func (a *StringArray) Scan(value interface{}) error {
+func (sa *StringArray) Scan(value interface{}) error {
 	if value == nil {
-		*a = []string{}
+		*sa = []string{}
 		return nil
 	}
 	bytes, ok := value.([]byte)
 	if !ok {
 		return fmt.Errorf("failed to scan StringArray: expected []byte, got %T", value)
 	}
-	return json.Unmarshal(bytes, a)
+	return json.Unmarshal(bytes, sa)
 }
 
-func (a StringArray) Value() (driver.Value, error) {
-	if len(a) == 0 {
+func (sa StringArray) Value() (driver.Value, error) {
+	if len(sa) == 0 {
 		return []byte("[]"), nil
 	}
-	return json.Marshal(a)
+	return json.Marshal(sa)
 }
 
 var db *gorm.DB
 var clients = make(map[int]*websocket.Conn)
+var r *gin.Engine
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -58,6 +58,7 @@ type User struct {
 	Role        string      `json:"role" gorm:"not null"`
 	FullName    string      `json:"full_name"`
 	Description string      `json:"description"`
+	AvatarURL   string      `json:"avatar_url"`
 	Services    StringArray `json:"services" gorm:"type:jsonb"`
 	CreatedAt   time.Time   `json:"created_at" gorm:"autoCreateTime"`
 }
@@ -70,7 +71,7 @@ type Course struct {
 	Description string          `json:"description" gorm:"not null"`
 	Price       decimal.Decimal `json:"price" gorm:"type:decimal(10,2);not null"`
 	VideoURL    string          `json:"video_url"`
-	Teacher     User            `gorm:"foreignKey:TeacherID"`
+	Teacher     User            `json:"teacher" gorm:"foreignKey:TeacherID"`
 	CreatedAt   time.Time       `json:"created_at" gorm:"autoCreateTime"`
 }
 
@@ -138,7 +139,14 @@ func main() {
 	}
 	db.AutoMigrate(&User{}, &Course{}, &Payment{}, &Message{}, &Notification{}, &Review{})
 
-	r := gin.Default()
+	// Test data for development
+	testPassword, _ := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
+	db.Create(&User{Username: "nutri1", Email: "nutri1@example.com", Password: string(testPassword), Role: "nutri", FullName: "Nutri One", Description: "Expert in nutrition", AvatarURL: "/images/nutri-placeholder.jpg"})
+	db.Create(&Course{TeacherID: 1, Title: "Nutrition Course 1", Services: StringArray{"Consultation"}, Description: "Learn nutrition basics", Price: decimal.NewFromFloat(100.00), VideoURL: "https://example.com/video1"})
+	db.Create(&Course{TeacherID: 1, Title: "Nutrition Course 2", Services: StringArray{"Detox"}, Description: "Detox program", Price: decimal.NewFromFloat(200.00), VideoURL: "https://example.com/video2"})
+	db.Create(&User{Username: "client1", Email: "client1@example.com", Password: string(testPassword), Role: "client", FullName: "Client One"})
+
+	r = gin.Default()
 
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
@@ -179,17 +187,26 @@ func main() {
 	r.GET("/api/reviews/course/:course_id", getReviewsByCourse)
 	r.GET("/api/nutris", getNutris)
 	r.GET("/api/reviews/random", getRandomReviews)
-	r.POST("/api/start-chat", startChat)
-	r.GET("/api/chats", getChats)
-	r.GET("/ws", handleWebSocket)
+	r.POST("/api/start-chat", authMiddleware(), startChat)
+	r.GET("/api/chats", authMiddleware(), getChats)
+	r.GET("/ws", func(c *gin.Context) {
+		handleWebSocket(c.Writer, c.Request)
+	})
 
-	r.Run(":8080")
+	if err := r.Run(":8080"); err != nil {
+		log.Fatal("Ошибка запуска сервера: ", err)
+	}
 }
 
-func authMiddleware(requiredRole ...string) gin.HandlerFunc {
+func authMiddleware(requiredRoles ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenString := c.GetHeader("Authorization")
 		if tokenString == "" || len(tokenString) <= 7 || tokenString[:7] != "Bearer " {
+			if c.Request.Method == "GET" && c.Request.URL.Path == "/api/payments" {
+				c.JSON(http.StatusOK, []Payment{})
+				c.Abort()
+				return
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Токен не предоставлен"})
 			c.Abort()
 			return
@@ -203,18 +220,32 @@ func authMiddleware(requiredRole ...string) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		claims, _ := token.Claims.(jwt.MapClaims)
+		claims, ok := token.Claims.(jwt.MapClaims)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Неверные данные токена"})
+			c.Abort()
+			return
+		}
 		userID := int(claims["id"].(float64))
 		role := claims["role"].(string)
 		c.Set("user_id", userID)
 		c.Set("role", role)
-		if len(requiredRole) > 0 && role != requiredRole[0] {
+		if len(requiredRoles) > 0 && !containsRole(requiredRoles, role) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Недостаточно прав"})
 			c.Abort()
 			return
 		}
 		c.Next()
 	}
+}
+
+func containsRole(roles []string, role string) bool {
+	for _, r := range roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
 }
 
 func registerUser(c *gin.Context) {
@@ -233,6 +264,9 @@ func registerUser(c *gin.Context) {
 		return
 	}
 	user.Password = string(hashedPassword)
+	if user.AvatarURL == "" {
+		user.AvatarURL = "/images/nutri-placeholder.jpg"
+	}
 	if err := db.Create(&user).Error; err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Не удалось создать пользователя: " + err.Error()})
 		return
@@ -321,6 +355,7 @@ func updateProfile(c *gin.Context) {
 	if err := db.Model(&User{}).Where("id = ?", userID).Updates(map[string]interface{}{
 		"full_name":   input.FullName,
 		"description": input.Description,
+		"avatar_url":  input.AvatarURL,
 	}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Не удалось обновить профиль"})
 		return
@@ -333,24 +368,29 @@ func searchCourses(c *gin.Context) {
 	var courses []Course
 	q := db.Preload("Teacher").Where("teacher_id IN (SELECT id FROM users WHERE role = 'nutri')")
 	if query != "" {
-		query = strings.ToLower(query)
-		q = q.Where("LOWER(title) LIKE ? OR LOWER(description) LIKE ?", "%"+query+"%", "%"+query+"%")
+		query = "%" + strings.ToLower(query) + "%"
+		q = q.Where("LOWER(title) LIKE ? OR LOWER(description) LIKE ?", query, query)
 	}
-	q.Order("title ASC, id ASC").Find(&courses)
+	if err := q.Order("title ASC, id ASC").Find(&courses).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка поиска курсов"})
+		return
+	}
+	for i := range courses {
+		courses[i].Teacher.Password = ""
+	}
 	c.JSON(http.StatusOK, courses)
 }
 
 func getCourses(c *gin.Context) {
 	var courses []Course
-	q := db.Preload("Teacher")
-	teacherIDStr := c.Query("teacher_id")
-	var teacherID int
-	if teacherIDStr == "" {
-		teacherID = c.GetInt("user_id")
-	} else {
-		teacherID, _ = strconv.Atoi(teacherIDStr)
+	teacherID := c.GetInt("user_id")
+	if err := db.Preload("Teacher").Where("teacher_id = ?", teacherID).Find(&courses).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка загрузки курсов"})
+		return
 	}
-	q.Where("teacher_id = ?", teacherID).Find(&courses)
+	for i := range courses {
+		courses[i].Teacher.Password = ""
+	}
 	c.JSON(http.StatusOK, courses)
 }
 
@@ -406,6 +446,7 @@ func getCourseById(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Курс не найден"})
 		return
 	}
+	course.Teacher.Password = ""
 	c.JSON(http.StatusOK, course)
 }
 
@@ -424,7 +465,9 @@ func deleteCourse(c *gin.Context) {
 
 func simulatePayment(c *gin.Context) {
 	var input struct {
-		CourseID int `json:"course_id"`
+		CourseID int             `json:"course_id"`
+		UserID   int             `json:"user_id"`
+		Amount   decimal.Decimal `json:"amount"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -436,16 +479,20 @@ func simulatePayment(c *gin.Context) {
 		return
 	}
 	var existing Payment
-	if db.Where("user_id = ? AND course_id = ? AND status = 'success'", c.GetInt("user_id"), input.CourseID).First(&existing).Error == nil {
+	if db.Where("user_id = ? AND course_id = ? AND status = 'success'", input.UserID, input.CourseID).First(&existing).Error == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Курс уже оплачен"})
 		return
 	}
-	amount := course.Price
-	commission := amount.Mul(decimal.NewFromFloat(0.5))
+	if !input.Amount.Equal(course.Price) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверная сумма оплаты"})
+		return
+	}
+	amount := input.Amount
+	commission := amount.Mul(decimal.NewFromFloat(0.05))
 	netAmount := amount.Sub(commission)
-	transactionID := "fake_" + strconv.Itoa(rand.Intn(1000000))
+	transactionID := "TX-" + strconv.Itoa(rand.Intn(1000000))
 	payment := Payment{
-		UserID:        c.GetInt("user_id"),
+		UserID:        input.UserID,
 		CourseID:      input.CourseID,
 		Amount:        amount,
 		Commission:    commission,
@@ -462,14 +509,14 @@ func simulatePayment(c *gin.Context) {
 	notiTeacher.UserID = course.TeacherID
 	notiTeacher.Type = "payment"
 	notiTeacher.RelatedID = payment.ID
-	notiTeacher.Content = "Получен новый платеж за курс: " + course.Title
+	notiTeacher.Content = fmt.Sprintf("Клиент оплатил курс %s: %s RUB", course.Title, netAmount.String())
 	notiTeacher.Read = false
 	notiTeacher.CreatedAt = time.Now()
 	db.Create(&notiTeacher)
 	jsonNotiTeacher, _ := json.Marshal(notiTeacher)
 	sendToUser(course.TeacherID, []byte(`{"type":"notification","data":`+string(jsonNotiTeacher)+`}`))
 	var notiClient Notification
-	notiClient.UserID = c.GetInt("user_id")
+	notiClient.UserID = input.UserID
 	notiClient.Type = "payment"
 	notiClient.RelatedID = payment.ID
 	notiClient.Content = "Оплата за курс " + course.Title + " успешна"
@@ -477,19 +524,18 @@ func simulatePayment(c *gin.Context) {
 	notiClient.CreatedAt = time.Now()
 	db.Create(&notiClient)
 	jsonNotiClient, _ := json.Marshal(notiClient)
-	sendToUser(c.GetInt("user_id"), []byte(`{"type":"notification","data":`+string(jsonNotiClient)+`}`))
+	sendToUser(input.UserID, []byte(`{"type":"notification","data":`+string(jsonNotiClient)+`}`))
 	c.JSON(http.StatusOK, gin.H{"transaction_id": transactionID, "status": "success"})
 }
 
 func getPayments(c *gin.Context) {
 	userID := c.GetInt("user_id")
-	role := c.GetString("role")
 	var payments []Payment
-	if role == "nutri" {
-		db.Joins("JOIN courses ON courses.id = payments.course_id").Where("courses.teacher_id = ? AND payments.status = 'success'", userID).Find(&payments)
-	} else {
-		db.Where("user_id = ? AND status = 'success'", userID).Find(&payments)
+	if userID == 0 {
+		c.JSON(http.StatusOK, []Payment{})
+		return
 	}
+	db.Where("user_id = ? AND status = 'success'", userID).Find(&payments)
 	c.JSON(http.StatusOK, payments)
 }
 
@@ -530,7 +576,7 @@ func sendMessage(c *gin.Context) {
 	noti.UserID = msg.ReceiverID
 	noti.Type = "message"
 	noti.RelatedID = msg.SenderID
-	noti.Content = "Новое сообщение от " + sender.Username
+	noti.Content = "Новое сообщение от " + sender.FullName
 	noti.Read = false
 	noti.CreatedAt = time.Now()
 	db.Create(&noti)
@@ -564,8 +610,11 @@ func markMessagesRead(c *gin.Context) {
 		return
 	}
 	userID := c.GetInt("user_id")
-	db.Where("sender_id = ? AND receiver_id = ?", receiverID, userID).Update("read", true)
-	c.JSON(http.StatusOK, gin.H{"message": "Сообщения отмечены как прочитанные"})
+	if err := db.Model(&Message{}).Where("sender_id = ? AND receiver_id = ?", receiverID, userID).Update("read", true).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка отметки прочитанных"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "marked as read"})
 }
 
 func getNotifications(c *gin.Context) {
@@ -636,23 +685,20 @@ func getNutris(c *gin.Context) {
 	limitStr := c.Query("limit")
 	limit, err := strconv.Atoi(limitStr)
 	if err != nil || limit <= 0 {
-		limit = 4 // Default limit as per your request
+		limit = 6
 	}
 	if limit > 100 {
 		limit = 100
 	}
-	random := c.Query("random") == "true"
-	q := db.Where("role = 'nutri'")
-	if random {
-		q = q.Order("RANDOM()")
-	}
 	var users []User
-	if err := q.Limit(limit).Find(&users).Error; err != nil {
-		log.Println("getNutris error:", err)
+	if err := db.Where("role = ?", "nutri").Limit(limit).Find(&users).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка загрузки нутрициологов"})
+		return
+	}
+	if len(users) == 0 {
 		c.JSON(http.StatusOK, []User{})
 		return
 	}
-	log.Printf("getNutris found %d nutris", len(users))
 	for i := range users {
 		users[i].Password = ""
 	}
@@ -684,42 +730,95 @@ func startChat(c *gin.Context) {
 func getChats(c *gin.Context) {
 	userID := c.GetInt("user_id")
 	var dialogs []Dialog
-	db.Raw(`
-		SELECT DISTINCT ON (u.id) u.id as user_id, u.full_name, '' as avatar_url, m.content as last_message, 
-		COUNT(CASE WHEN m.read = false AND m.sender_id = u.id THEN 1 END) as unread_count
+	var unread int64
+	if err := db.Raw(`
+		SELECT u.id AS user_id, u.full_name, u.avatar_url, m.content AS last_message, 
+		COUNT(CASE WHEN m.read = false AND m.sender_id != ? THEN 1 END) AS unread_count
 		FROM users u
 		JOIN messages m ON (m.sender_id = u.id AND m.receiver_id = ?) OR (m.receiver_id = u.id AND m.sender_id = ?)
 		WHERE u.id != ?
-		GROUP BY u.id, m.content
-		ORDER BY u.id, m.created_at DESC
-	`, userID, userID, userID).Scan(&dialogs)
+		GROUP BY u.id, u.full_name, u.avatar_url, m.content, m.created_at
+		ORDER BY m.created_at DESC
+	`, userID, userID, userID, userID).Scan(&dialogs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка загрузки чатов"})
+		return
+	}
+	for i := range dialogs {
+		db.Model(&Message{}).Where("receiver_id = ? AND sender_id = ? AND read = false", userID, dialogs[i].UserID).Count(&unread)
+		dialogs[i].UnreadCount = int(unread)
+	}
 	c.JSON(http.StatusOK, dialogs)
 }
 
-func handleWebSocket(c *gin.Context) {
-	tokenString := c.Query("token")
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Ошибка апгрейда WebSocket: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	tokenString := r.URL.Query().Get("token")
+	if tokenString == "" {
+		conn.WriteMessage(websocket.TextMessage, []byte("Токен не предоставлен"))
+		return
+	}
+
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		return []byte(os.Getenv("JWT_SECRET")), nil
 	})
 	if err != nil || !token.Valid {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Неверный токен"})
+		conn.WriteMessage(websocket.TextMessage, []byte("Неверный токен"))
 		return
 	}
-	claims, _ := token.Claims.(jwt.MapClaims)
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		conn.WriteMessage(websocket.TextMessage, []byte("Неверные данные токена"))
+		return
+	}
+
 	userID := int(claims["id"].(float64))
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		return
-	}
 	clients[userID] = conn
-	defer func() {
-		conn.Close()
-		delete(clients, userID)
-	}()
+
 	for {
-		_, _, err := conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
+			log.Printf("Ошибка чтения WebSocket для пользователя %d: %v", userID, err)
+			delete(clients, userID)
 			break
+		}
+		var input struct {
+			ReceiverID int    `json:"receiver_id"`
+			Content    string `json:"content"`
+		}
+		if err := json.Unmarshal(message, &input); err != nil {
+			log.Printf("Ошибка парсинга JSON: %v", err)
+			continue
+		}
+		newMessage := Message{
+			SenderID:   userID,
+			ReceiverID: input.ReceiverID,
+			Content:    input.Content,
+			CreatedAt:  time.Now(),
+		}
+		if err := db.Create(&newMessage).Error; err != nil {
+			log.Printf("Ошибка создания сообщения: %v", err)
+			continue
+		}
+		broadcastMessage(newMessage)
+	}
+}
+
+func broadcastMessage(message Message) {
+	for userID, conn := range clients {
+		if userID == message.SenderID || userID == message.ReceiverID {
+			continue
+		}
+		if err := conn.WriteJSON(message); err != nil {
+			log.Printf("Ошибка отправки сообщения пользователю %d: %v", userID, err)
+			conn.Close()
+			delete(clients, userID)
 		}
 	}
 }
@@ -727,6 +826,7 @@ func handleWebSocket(c *gin.Context) {
 func sendToUser(userID int, message []byte) {
 	if conn, ok := clients[userID]; ok {
 		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			log.Printf("Ошибка отправки WebSocket сообщения пользователю %d: %v", userID, err)
 			conn.Close()
 			delete(clients, userID)
 		}
